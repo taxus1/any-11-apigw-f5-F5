@@ -40,7 +40,7 @@ class InMemoryRouteStore extends RouteStore {
     }
 
     @Override
-    public Mono<Void> delete(String routeNo, Integer expectVersion) {
+    public Mono<Long> delete(String routeNo, Integer expectVersion) {
         throw new UnsupportedOperationException();
     }
 }

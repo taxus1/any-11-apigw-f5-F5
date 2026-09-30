@@ -23,6 +23,9 @@ logs/
 application-local.yml
 **/application-secret.yml
 
+# 路由本机快照（运行时缓存，不入库）
+data/
+
 # OS / 杂项
 .DS_Store
 *.tmp

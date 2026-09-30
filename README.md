@@ -4,7 +4,7 @@ Spring Cloud Gateway（WebFlux 响应式）+ Redis 动态路由配置。JDK 17 /
 
 同一个应用里跑三件事：
 
-1. **转发链路**：请求进来 → 按配置的匹配条件找到路由 → 按配置的转发动作处理请求头 → 打到上游 → 响应回来处理响应头 → 交还调用方。配置在 Redis，改完经事件即时生效，不用重启（另有定时兜底刷新保证多实例最终一致）。
+1. **转发链路**：请求进来 → 按配置的匹配条件找到路由 → 按配置的转发动作处理请求头 → 打到上游 → 响应回来处理响应头 → 交还调用方。配置在 Redis；后台保存后先在各台备齐整棵路由树，再按统一点切换，网关不用重启。
 2. **路由管理接口**：`/api/gateway/routes`，维护路由及其匹配条件、转发动作。
 3. **第三方接入管理 + 鉴权**：`/api/gateway/apps`，维护第三方应用凭据与来路名单；开启后转发流量必须凭「应用编号 + 密钥」通过鉴权才放行。
 
@@ -25,6 +25,9 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | GET | `/api/gateway/routes/{routeNo}` | 路由详情（含全部子项，按顺序号排好） |
 | GET | `/api/gateway/routes?pageNum=&pageSize=&keyword=` | 分页列表（每条带条件/动作计数） |
 | DELETE | `/api/gateway/routes/{routeNo}?expectVersion=` | 删除路由（整树清掉） |
+| POST | `/api/gateway/route-config/refresh` | 手动通知三台强拉一次最新配置 |
+| GET | `/api/gateway/route-config/refresh/{commandId}` | 查手动刷新每台响应/未响应实例 |
+| GET | `/api/gateway/route-config/status` | 查三台当前激活版本、备齐版本、上次刷新时间、错误 |
 | GET | `/api/gateway/access-logs?startTime=&endTime=&routeNo=&statusCode=&pageNum=&pageSize=` | 按条件翻访问流水（时间必填，见「翻流水」） |
 
 所有接口返回统一结构 `{ code, msg, data }`：
@@ -142,11 +145,48 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 - 错误体只有网关的固定文案 + traceId，绝不外抛内部堆栈或上游原始错误页。
 - 超时参数可调：`apigw.proxy.connect-timeout`（默认 3s）、`apigw.proxy.response-timeout`（默认 10s）。
 
-### 热刷新（不重启生效）
+### 热刷新与三机一致性
 
-- 管理接口增/删/改成功后发布进程内 `RoutesChangedEvent`，本实例的路由快照立即重载——新配路由**马上能走通**。
-- 另有 10s 定时兜底刷新（`apigw.proxy.route-refresh-interval`），多实例部署时别的实例改了配置，靠它在一个周期内收敛。
-- Redis 一时抖动：已有快照时沿用上一份继续转发，只在从没加载成功过时回 503。
+**配置源**：Redis 仍是唯一真源，路由主 Hash 仍是原来的 `apigw:routes`，每条路由的 JSON 继续包含主记录、条件、动作和灰度组，不改表结构。旁边只增加协调用元数据：
+
+- `apigw:routes:revision`：全局单调版本，新增/修改/删除/停用任一成功提交都会在同一个 Lua 脚本里推进；
+- `apigw:route-config:nodes:{nodeId}`：实例心跳，带当前激活 revision/checksum、已备齐 revision/checksum、上次刷新时间和错误；
+- `apigw:route-config:fence`：三台都备齐后的两阶段切换栅栏（FENCING/COMMITTED/ABORTED），成员到齐记录也在同一族 key；
+- `apigw:route-config:{changed,activation,commands}`：Redis Pub/Sub 通知频道。
+
+**推还是拉**：采用「推唤醒 + 拉取兜底」。后台写库成功的那台先拉齐新版本，再发 changed 推送；另外两台收到后主动拉全量。推送只负责唤醒，不承载配置内容，所以重复、乱序或丢消息都不会写入半份配置。每台另有 5s 轮询（`apigw.proxy.route-config.poll-interval`），Pub/Sub 抖动、网络短断、实例刚重连都靠它追齐。最坏感知延迟约为：5s 轮询 + 3s 栅栏准备 + 2s 栅栏等待，正常推送路径约 3~5s；切换点前的请求继续走旧版，切换点后的请求不会与旧版混跑。
+
+**一次提交的原子性**：单条路由本来就是一个 Hash field，条件/动作都在同一份 JSON 里；现在把「检查乐观锁 version、整树 HSET/HDEL、推进全局 revision」放进一个 Lua 脚本。读侧按「revision → 全量路由 → revision」读，前后 revision 不一致就重试。因此新增、改内容、删除、停用，以及只改条件或动作，都只能看到完整的新树或完整的旧树，不会看到主表新、子项旧。
+
+**三台切换流程**：
+
+1. 后台只写一次 Redis，全局 revision 从 N 变 N+1。
+2. 每台拉到 N+1 后先放入本机 `staged`，写心跳声明「我已备齐 revision=N+1，checksum=...」；此刻流量仍全部走旧的 active。
+3. 协调器检查固定三台（生产设置 `GATEWAY_EXPECTED_INSTANCES=3`，也可为每台设置稳定的 `GATEWAY_NODE_ID`）是否都在线且 staged checksum 完全相同。
+4. 三台都备齐才写 `FENCE`：统一定一个 3s 后的栅栏点（默认 `switch-delay`），广播给三台。栅栏点前所有流量仍走旧版；到点后三台先暂停新的路由判定（极短等待，不返回错误、不打上游）。
+5. 各台把「我已进入栅栏」写入 Redis；协调器在 `fence-grace`（默认 2s）内等三台都到齐。到齐后写 `COMMITTED`，三台用一次 volatile 引用把不可变整树切到新版并恢复放行。
+6. 任一台没备齐、checksum 不同、在线数不足三台，或栅栏在 2s 内没到齐，就 `ABORTED` 本次切换并恢复旧版；等待中的请求继续走旧版，不会被拒绝，也不会打到上游的半套配置。
+7. 请求开头拿到的是哪版，整条请求（匹配、动作、灰度上游）都用哪版；栅栏保证切换瞬间不会一批新、一批旧。
+
+**故障与恢复**：拉新失败绝不替换当前 active 引用，已有版本继续转发；只有机器从未成功加载且本地也没有快照时才回 503 `CONFIG_UNAVAILABLE`。每次成功激活会把最后一份好快照原子写到本机 `data/route-snapshot-*.json`（可用 `snapshot-file` 改路径），机器晚重启或 Redis 短暂不可用时先用这份旧快照顶住；恢复连接后轮询会先读 active marker，缺推送也能补定时器并追到最新。三台固定成员模式下，某台心跳 TTL（默认 12s）过期仍未恢复时不会把变更切给剩余两台；应先恢复该节点，或确认缩容后调整 `GATEWAY_EXPECTED_INSTANCES`。
+
+- 启用/新增管理接口前，三台先用 `GATEWAY_NODE_ID=gw-1/2/3` 固定身份，并统一设置 `GATEWAY_EXPECTED_INSTANCES=3`；不要依赖随机节点 ID。
+- 统一点仍按机器墙钟提前广播，因此三台仍建议开 NTP；即使时钟有几秒偏差，两阶段栅栏也只是让快机多等慢机，不会在栅栏期间放行旧配置。超过 `fence-grace` 还没到齐则放弃切换、继续旧版。
+
+**手动排障**：
+
+```bash
+# 1) 发起三台强刷，拿 commandId
+curl -X POST http://网关/api/gateway/route-config/refresh
+
+# 2) 看哪些机器成功/失败、当前 revision/checksum、routeCount、错误
+curl http://网关/api/gateway/route-config/refresh/{commandId}
+
+# 3) 看三台总览：activeRevision、stagedRevision、lastRefreshAt、lastError
+curl http://网关/api/gateway/route-config/status
+```
+
+手动强刷也遵守 barrier：未三台备齐时只 staged 不切，避免排障动作本身制造分裂。这几个接口应只暴露到运维网段并纳入管理侧鉴权。
 
 ### 灰度发布（标记直达 + 按权重分流）
 
@@ -175,7 +215,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 - 组名路由内唯一（字母数字与 `._-`）；同一个标记值不允许挂在两个组上（否则该落到哪组本身说不清）；每组上游都按主上游同一套 URL 口径校验。
 - 请求**没有标记时的默认口径**：不挑人，按权重散；配了灰度就不再走路由顶层的 `upstream`（顶层 `upstream` 只在「一条灰度组都没配」时使用，旧路由行为不变）。
 
-**生效与性能：** 灰度配置就是路由配置的一部分，走同一条热刷新链路——管理接口改完本实例经事件即时生效，多实例 10s 兜底收敛，不用重启。转发热路径只做一次头查找 + 一次微秒级整数轮询（分组计划按路由编号 + 乐观锁版本缓存：同版本快照重载不重置轮询计数器，低流量下小权重组也不会因反复重置而永远选不上；版本一变立刻按新计划）。审计日志 OUT 段多一个 `grayGroup=` 字段，记录这笔请求最终落在了哪组（无灰度记 `-`）。
+**生效与性能：** 灰度配置就是路由配置的一部分，走同一条热刷新链路——三台先各自备齐同一 checksum 的整棵树，再通过两阶段栅栏统一切换。转发热路径只读本机不可变快照，做一次头查找 + 一次微秒级整数轮询（分组计划按路由编号 + 乐观锁版本缓存：同版本快照重载不重置轮询计数器，低流量下小权重组也不会因反复重置而永远选不上；版本一变立刻按新计划）。审计日志 OUT 段多一个 `grayGroup=` 字段，记录这笔请求最终落在了哪组（无灰度记 `-`）。
 
 ### 访问审计（查账）
 

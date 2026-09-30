@@ -25,14 +25,22 @@ server:
   port: ${SERVER_PORT:8080}
 
 # 转发链路参数：连不上上游（3s 握手不成）→ 502；上游半天不吭声（10s 不回）→ 504。
-# 路由快照事件即时刷新 + 10s 兜底轮询，所以增删改路由不用重启即可生效。
+# 路由推送默认毫秒级；Pub/Sub 丢失时 5s 轮询兜底。三台部署把 expected-instances 固定为 3。
 apigw:
   proxy:
     connect-timeout: 3s
     response-timeout: 10s
-    route-refresh-interval: 10s
-    # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
-    route-refresh-interval-ms: 10000
+    route-refresh-interval: 5s
+    route-config:
+      node-id: ${GATEWAY_NODE_ID:}
+      expected-instances: ${GATEWAY_EXPECTED_INSTANCES:0}
+      poll-interval: 5s
+      poll-interval-ms: 5000
+      heartbeat-interval: 3s
+      heartbeat-ttl: 12s
+      switch-delay: 3s
+      fence-grace: 2s
+      max-clock-skew: 1s
     # 灰度标记请求头：值大小写敏感、精确匹配（多空格/大小写不一致一律当没带，回落按权重分）。
     # 默认 X-Gray-Tag，可经环境变量改；标记优先级永远高于权重，详见 README「灰度发布」。
     gray:

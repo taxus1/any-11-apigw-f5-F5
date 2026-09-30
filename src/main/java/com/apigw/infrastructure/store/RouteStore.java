@@ -7,6 +7,7 @@ import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.RuleTypes;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -14,15 +15,15 @@ import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import java.time.Duration;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.UUID;
-import java.util.function.Supplier;
 
 /**
  * 路由配置在 Redis 里的读写封装。
@@ -37,8 +38,9 @@ import java.util.function.Supplier;
  *   不可能出现「主记录进了、子记录没进」的残缺路由，也不需要手工回滚；
  * - 读出来永远是一整份完整配置，没有无主的子记录可留。
  *
- * 编号占用用 HSETNX 原子判定；同一条路由的「读版本→写回」用短租约锁串行化，
- * 再配合 version 乐观锁：后到的旧版本提交会被拒，提示「你这份旧了」。
+ * 编号占用用 HSETNX 原子判定；同一条路由的「读版本→写回」用 Lua 脚本串行完成，
+ * 同时推进全局 revision。revision 不是路由 JSON 里的字段，而是旁边的元数据，
+ * 因此原有路由 Hash 的形状不变，后台/历史数据不需要迁移。
  *
  * 这里只负责序列化与并发控制，业务规则在 {@link GatewayRoute} 聚合里。
  */
@@ -46,22 +48,65 @@ import java.util.function.Supplier;
 public class RouteStore {
 
     public static final String ROUTES_KEY = "apigw:routes";
+    public static final String REVISION_KEY = "apigw:routes:revision";
 
-    private static final Duration LOCK_TTL = Duration.ofSeconds(5);
-    private static final int LOCK_RETRY = 50;
+    private static final RedisScript<List> CREATE_SCRIPT = new DefaultRedisScript<>("""
+            local exists = redis.call('HEXISTS', KEYS[1], ARGV[1])
+            if exists == 1 then
+                return {'BUSY', '-1', '-1', '-1'}
+            end
+            local revision = redis.call('INCR', KEYS[2])
+            redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+            return {'OK', '0', tostring(revision), '-1'}
+            """, List.class);
 
-    /** 释放锁的 Lua：只有锁的持有者（token 对得上）才能删，避免 TTL 边缘误删别人的锁。 */
-    private static final RedisScript<Long> UNLOCK_SCRIPT = new DefaultRedisScript<>(
-            "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                    + "return redis.call('del', KEYS[1]) else return 0 end",
-            Long.class);
+    private static final RedisScript<List> UPDATE_SCRIPT = new DefaultRedisScript<>("""
+            local current = redis.call('HGET', KEYS[1], ARGV[1])
+            if not current then
+                return {'NOT_FOUND', '-1', '-1', '-1'}
+            end
+            local expected = tonumber(ARGV[3])
+            local currentVersion = cjson.decode(current)['version'] or 0
+            if currentVersion ~= expected then
+                return {'CONFLICT', tostring(currentVersion), '-1', '-1'}
+            end
+            cjson.encode_empty_table_as_object(false)
+            local nextVersion = currentVersion + 1
+            local nextJson = cjson.decode(ARGV[2])
+            nextJson['version'] = nextVersion
+            local currentId = cjson.decode(current)['id']
+            nextJson['id'] = currentId
+            local revision = redis.call('INCR', KEYS[2])
+            redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(nextJson))
+            return {'OK', tostring(nextVersion), tostring(revision), tostring(currentId)}
+            """, List.class);
+
+    private static final RedisScript<List> DELETE_SCRIPT = new DefaultRedisScript<>("""
+            local current = redis.call('HGET', KEYS[1], ARGV[1])
+            if not current then
+                return {'NOT_FOUND', '-1', '-1', '-1'}
+            end
+            if ARGV[3] ~= '' then
+                local expected = tonumber(ARGV[3])
+                local currentVersion = cjson.decode(current)['version'] or 0
+                if expected ~= nil and currentVersion ~= expected then
+                    return {'CONFLICT', tostring(currentVersion), '-1', '-1'}
+                end
+            end
+            local revision = redis.call('INCR', KEYS[2])
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            return {'OK', '-1', tostring(revision), '-1'}
+            """, List.class);
 
     private final ReactiveStringRedisTemplate redis;
     private final ObjectMapper objectMapper;
+    private final ObjectMapper canonicalMapper;
 
     public RouteStore(ReactiveStringRedisTemplate redis, ObjectMapper objectMapper) {
         this.redis = redis;
         this.objectMapper = objectMapper;
+        this.canonicalMapper = objectMapper.copy()
+                .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
     }
 
     /** 读全部路由（含子项）。 */
@@ -76,117 +121,139 @@ public class RouteStore {
                 .map(v -> deserialize(v.toString()));
     }
 
+    /** 当前全局配置版本号；没有任何管理写入时可能为空。 */
+    public Mono<Long> currentRevision() {
+        return redis.opsForValue().get(REVISION_KEY)
+                .map(Long::valueOf)
+                .defaultIfEmpty(0L);
+    }
+
     /**
-     * 新建：用 HSETNX 原子占位——field 不存在才写入。
+     * 新建：HSETNX、写入全局 revision 在同一个 Lua 脚本里完成。
      *
      * 「先查有没有、再写」在两步之间有窗口，两个人同时建同一个编号会双双成功；
-     * HSETNX 把查重和写入合成 Redis 里的一个原子动作，谁先谁赢，后来者直接收占用错误。
+     * Lua 把查重、占位和版本推进合成 Redis 里的一个原子动作，谁先谁赢，后来者直接收占用错误。
      * 停用的路由也占着编号（field 还在），删除才真正释放编号。
      */
     public Mono<GatewayRoute> create(GatewayRoute route) {
         route.setVersion(0);
-        return redis.opsForHash().putIfAbsent(ROUTES_KEY, route.getRouteNo(), serialize(route))
-                .flatMap(acquired -> Boolean.TRUE.equals(acquired)
-                        ? Mono.just(route)
-                        : Mono.error(new BizException(
-                                "路由编号已被占用（停用的路由也占号）：" + route.getRouteNo())));
+        return executeWrite(CREATE_SCRIPT, route.getRouteNo(), serialize(route), "")
+                .flatMap(result -> {
+                    if ("BUSY".equals(result.status())) {
+                        return Mono.error(new BizException(
+                                "路由编号已被占用（停用的路由也占号）：" + route.getRouteNo()));
+                    }
+                    route.setVersion((int) result.version());
+                    return Mono.just(route);
+                });
     }
 
     /**
      * 修改（整树覆盖）。必须显式带上读取时拿到的 version：
-     * - 锁保证同一时刻只有一个人在「读版本→写回」；
+     * - Lua 脚本保证读当前版本、比较、整树覆盖和推进全局 revision 是一个临界区；
      * - version 比对保证旧版本提交进不来，写入后版本 +1。
      * 两个人同时改同一条，后到的拿到的版本已变，会收到明确的「你这份旧了」。
      */
     public Mono<GatewayRoute> update(GatewayRoute route) {
         Integer expectVersion = route.getVersion();
         if (expectVersion == null) {
-            // 不允许「不带版本就改」，否则等于把乐观锁绕过去，静默覆盖别人的修改。
-            // 错误经 Mono 发出而非同步抛出：这是响应式契约，调用方的 onErrorResume 才接得住，
-            // 反应式链路上也不会突然冒一个同步异常出来
+            // 错误经 Mono 发出而非同步抛出：这是响应式契约，调用方的 onErrorResume 才接得住
             return Mono.error(new BizException(
                     "修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测"));
         }
-        return withLock(route.getRouteNo(), () ->
-                findByRouteNo(route.getRouteNo())
-                        .switchIfEmpty(Mono.error(new BizException(404, "路由不存在：" + route.getRouteNo())))
-                        .flatMap(existing -> {
-                            if (!expectVersion.equals(existing.getVersion())) {
-                                return Mono.error(versionConflict(existing.getVersion(), expectVersion));
-                            }
-                            // id 沿用旧的，编号建后不可改；整树覆盖子项
-                            route.setId(existing.getId());
-                            route.setVersion(existing.getVersion() + 1);
-                            return write(route).thenReturn(route);
-                        }));
+        return executeWrite(UPDATE_SCRIPT, route.getRouteNo(), serialize(route), expectVersion.toString())
+                .flatMap(result -> switch (result.status()) {
+                    case "NOT_FOUND" -> Mono.error(new BizException(404,
+                            "路由不存在：" + route.getRouteNo()));
+                    case "CONFLICT" -> Mono.error(versionConflict(result.version(), expectVersion));
+                    default -> {
+                        route.setId(result.id());
+                        route.setVersion((int) result.version());
+                        yield Mono.just(route);
+                    }
+                });
     }
 
     /**
-     * 删除：先确认存在（删不存在的不算成功，给明确结果），再 HDEL。
+     * 删除：存在性检查、版本检查、HDEL 与全局 revision 推进在同一个 Lua 脚本里。
      * 条件与动作跟主记录在同一个 field 里，一次 HDEL 整树清掉，不会留无主子记录。
-     * 带上 expectVersion 还能拦住「别人先改了、我手里还是旧版却来删」。
      */
-    public Mono<Void> delete(String routeNo, Integer expectVersion) {
-        return withLock(routeNo, () ->
-                findByRouteNo(routeNo)
-                        .switchIfEmpty(Mono.error(new BizException(404,
-                                "路由不存在，删除未执行：" + routeNo)))
-                        .flatMap(existing -> {
-                            if (expectVersion != null && !expectVersion.equals(existing.getVersion())) {
-                                return Mono.error(versionConflict(existing.getVersion(), expectVersion));
-                            }
-                            return redis.opsForHash().remove(ROUTES_KEY, routeNo).then();
-                        }));
+    public Mono<Long> delete(String routeNo, Integer expectVersion) {
+        String expected = expectVersion == null ? "" : expectVersion.toString();
+        return executeWrite(DELETE_SCRIPT, routeNo, "", expected)
+                .flatMap(result -> switch (result.status()) {
+                    case "NOT_FOUND" -> Mono.error(new BizException(404,
+                            "路由不存在，删除未执行：" + routeNo));
+                    case "CONFLICT" -> Mono.error(versionConflict(result.version(),
+                            expectVersion == null ? -1 : expectVersion));
+                    default -> Mono.just(result.revision());
+                });
     }
 
-    private BizException versionConflict(int currentVersion, int expectVersion) {
+    @SuppressWarnings("unchecked")
+    private Mono<WriteResult> executeWrite(RedisScript<List> script, String routeNo, String json,
+                                          String expectVersion) {
+        return redis.execute(script, List.of(ROUTES_KEY, REVISION_KEY),
+                        List.of(routeNo, json, expectVersion))
+                .next()
+                .map(raw -> {
+                    List<Object> values = (List<Object>) raw;
+                    String status = values.get(0).toString();
+                    long version = Long.parseLong(values.get(1).toString());
+                    long revision = Long.parseLong(values.get(2).toString());
+                    String id = values.get(3).toString();
+                    if ("-1".equals(id)) {
+                        id = null;
+                    }
+                    return new WriteResult(status, version, revision, id);
+                });
+    }
+
+    private BizException versionConflict(long currentVersion, int expectVersion) {
         return new BizException(409, "你这份配置已经旧了（当前版本 " + currentVersion
                 + "，你手上是 " + expectVersion + "），请重新拉取后再提交");
     }
 
-    private Mono<Void> write(GatewayRoute route) {
-        return redis.opsForHash()
-                .put(ROUTES_KEY, route.getRouteNo(), serialize(route))
-                .then();
-    }
-
-    /** 用一份完整配置替换整个 Hash —— 给后续「配置整体刷新」留的原子入口。 */
+    /** 用一份完整配置替换整个 Hash；保留给导入/修复场景，普通管理接口不走这条非原子入口。 */
     public Mono<Void> replaceAll(Map<String, GatewayRoute> routes) {
         Map<String, String> raw = new TreeMap<>();
         routes.forEach((k, v) -> raw.put(k, serialize(v)));
         return redis.delete(ROUTES_KEY)
                 .then(redis.opsForHash().putAll(ROUTES_KEY, raw))
+                .then(redis.opsForValue().increment(REVISION_KEY))
                 .then();
     }
 
-    /**
-     * 拿一把基于 Redis 的短租约锁（SET NX + TTL + 唯一 token），保证「读版本 → 写回」是临界区。
-     * 拿不到就小睡重试，超时抛业务异常，避免无限自旋；释放时用 Lua 比对 token，只删自己的锁。
-     */
-    private <T> Mono<T> withLock(String routeNo, Supplier<Mono<T>> action) {
-        String lockKey = "apigw:lock:route:" + routeNo;
-        String token = UUID.randomUUID().toString();
-        return tryLock(lockKey, token, 0)
-                .flatMap(acquired -> {
-                    if (!acquired) {
-                        return Mono.error(new BizException("这条路由正被另一个人修改，请稍后重试"));
-                    }
-                    return action.get()
-                            .doFinally(sig -> redis.execute(UNLOCK_SCRIPT, List.of(lockKey), List.of(token))
-                                    .subscribe());
-                });
+    /** 对一份完整路由树算稳定校验值；条件、动作、灰度组任一变化都会变。 */
+    public String checksum(GatewayRoute route) {
+        try {
+            byte[] bytes = canonicalMapper.writeValueAsBytes(Dto.from(route));
+            return sha256(bytes);
+        } catch (Exception e) {
+            throw new BizException("路由校验值计算失败：" + e.getMessage());
+        }
     }
 
-    private Mono<Boolean> tryLock(String lockKey, String token, int attempt) {
-        return redis.opsForValue()
-                .setIfAbsent(lockKey, token, LOCK_TTL)
-                .flatMap(ok -> {
-                    if (ok || attempt >= LOCK_RETRY) {
-                        return Mono.just(ok);
-                    }
-                    return Mono.delay(Duration.ofMillis(20))
-                            .then(tryLock(lockKey, token, attempt + 1));
-                });
+    public String checksum(List<GatewayRoute> routes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            routes.stream()
+                    .sorted(Comparator.comparing(GatewayRoute::getRouteNo))
+                    .forEach(route -> {
+                        digest.update(checksum(route).getBytes(StandardCharsets.UTF_8));
+                        digest.update((byte) '\n');
+                    });
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (Exception e) {
+            throw new BizException("路由快照校验值计算失败：" + e.getMessage());
+        }
+    }
+
+    private static String sha256(byte[] bytes) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+    }
+
+    public record WriteResult(String status, long version, long revision, String id) {
     }
 
     // ---- 序列化：不用 Java 原生序列化，存 JSON，便于人工排查与后续版本迁移 ----

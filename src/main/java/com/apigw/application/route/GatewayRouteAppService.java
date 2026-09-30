@@ -74,6 +74,7 @@ public class GatewayRouteAppService {
     /** 删除：不存在、版本旧了都会拿到明确的失败结果，绝不静默当成功。 */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
         return routeStore.delete(routeNo, expectVersion)
+                .then()
                 .doOnSuccess(v -> eventPublisher.publishEvent(RoutesChangedEvent.deleted(routeNo)));
     }
 

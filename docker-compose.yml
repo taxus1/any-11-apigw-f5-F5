@@ -1,5 +1,5 @@
 services:
-  # 路由配置的存储。网关启动即从这里读路由；改完配置不重启也生效（动态刷新在后续题目里做）。
+  # 路由配置的存储。网关启动从这里读路由；后台保存后由三台网关先 staged 备齐再统一切换，不重启。
   redis:
     image: redis:7.2-alpine
     container_name: apigw-redis
